@@ -269,3 +269,140 @@ const toolkitTools = await Promise.all(
 - Users enable/disable and configure toolkits in the UI; missing env vars are surfaced via a dialog.
 - Selections persist via cookies and can be pre-enabled via URL params or saved to workbenches.
 - On send, the server supplies selected tools to the model; the model invokes them via tool-calling with schema validation.
+
+### Custom in-chat tool UI
+- Each tool provides custom UI via two client renderers in its client config:
+  - CallComponent: rendered during call/partial-call
+  - ResultComponent: rendered when the tool returns
+
+```99:112:src/toolkits/types.ts
+export type ClientToolConfig<
+  Args extends ZodRawShape = ZodRawShape,
+  Result extends ZodRawShape = ZodRawShape,
+> = {
+  CallComponent: React.ComponentType<{
+    args: DeepPartial<z.infer<ZodObject<Args>>>;
+    isPartial: boolean;
+  }>;
+  ResultComponent: React.ComponentType<{
+    args: z.infer<ZodObject<Args>>;
+    result: z.infer<ZodObject<Result>>;
+    append: (message: CreateMessage) => void;
+  }>;
+};
+```
+
+- The message renderer automatically discovers the correct client toolkit and renders your UI components for each tool invocation.
+
+```47:59:src/app/(general)/_components/chat/messages/message-tool.tsx
+const [server, tool] = toolName.split("_");
+const typedServer = server as Toolkits;
+const clientToolkit = getClientToolkit(typedServer);
+const typedTool = tool as ServerToolkitNames[typeof typedServer];
+const toolConfig = clientToolkit.tools[typedTool];
+```
+
+```131:140:src/app/(general)/_components/chat/messages/message-tool.tsx
+{toolInvocation.args && (
+  <toolConfig.CallComponent
+    args={
+      toolInvocation.args as DeepPartial<
+        z.infer<typeof toolConfig.inputSchema>
+      >
+    }
+    isPartial={toolInvocation.state === "partial-call"}
+  />
+)}
+```
+
+```173:186:src/app/(general)/_components/chat/messages/message-tool.tsx
+<MessageToolResultComponent
+  Component={({ append }) => (
+    <toolConfig.ResultComponent
+      args={
+        toolInvocation.args as z.infer<
+          typeof toolConfig.inputSchema
+        >
+      }
+      result={result.result}
+      append={append}
+    />
+  )}
+/>
+```
+
+- Example: E2B Code Interpreter tool defines rich Call/Result UIs for code, images, HTML/SVG, JSON, charts, and logs.
+
+```152:165:src/toolkits/toolkits/e2b/tools/run_code/client.tsx
+export const e2bRunCodeToolConfigClient: ClientToolConfig<
+  typeof baseRunCodeTool.inputSchema.shape,
+  typeof baseRunCodeTool.outputSchema.shape
+> = {
+  CallComponent: ({ args, isPartial }) => {
+    return (
+      <div className="w-full space-y-2">
+        <h1 className="text-muted-foreground text-sm font-medium">
+          {isPartial ? "Writing Python Code" : "Executing Python Code"}
+        </h1>
+        {args.code && <CodeBlock language="python" value={args.code} />}
+      </div>
+    );
+  },
+```
+
+```166:176:src/toolkits/toolkits/e2b/tools/run_code/client.tsx
+ResultComponent: ({ result, args: { code } }) => {
+  const hasResults = result.results && result.results.length > 0;
+  const hasLogs =
+    result.logs.stdout.length > 0 || result.logs.stderr.length > 0;
+
+  return (
+    <div className="space-y-2">
+      <Accordion type="single" collapsible>
+        <AccordionItem value="args">
+          <AccordionTrigger className="cursor-pointer p-0 hover:no-underline">
+            <h2 className="text-muted-foreground text-sm font-medium">
+              Code
+            </h2>
+```
+
+### Running scripts in a sandbox
+- The E2B toolkit provides a secure Python sandbox using @e2b/code-interpreter. The server creates a sandbox, runs user-provided code, returns results/logs, then tears down the sandbox.
+
+```18:28:src/toolkits/toolkits/e2b/tools/run_code/server.ts
+const sandbox = await Sandbox.create({
+  apiKey: process.env.E2B_API_KEY,
+});
+const { results, logs } = await sandbox.runCode(code);
+await sandbox.kill();
+return { results: results, logs: logs };
+```
+
+- It requires the E2B_API_KEY; ensure this is set in your environment.
+
+```11:16:src/toolkits/toolkits/e2b/tools/run_code/server.ts
+if (!env.E2B_API_KEY) {
+  throw new Error(
+    "E2B_API_KEY environment variable is required but not set",
+  );
+}
+```
+
+```60:61:src/env.js
+// Code Interpreter toolkit
+if (process.env.E2B_API_KEY) toolkitsSchema.E2B_API_KEY = z.string();
+```
+
+- Toolkit descriptor highlights the capability:
+
+```6:13:src/toolkits/toolkits/e2b/server.ts
+export const e2bToolkitServer = createServerToolkit(
+  baseE2BToolkitConfig,
+  `You have access to the E2B toolkit for secure code execution and development environments. This toolkit provides:
+
+- **Run Code**: Execute Python code in isolated, secure cloud environments.`,
+  async () => ({
+    [E2BTools.RunCode]: e2bRunCodeToolConfigServer(),
+  }),
+);
+```
